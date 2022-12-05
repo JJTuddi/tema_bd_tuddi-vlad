@@ -137,11 +137,28 @@ INSERT INTO service_schedule (schedule_date, car_id, client_id) VALUES ("2022-11
 							("2022-11-20", 1, 2), ("2022-11-20", 1, 12), ("2022-11-20", 4, 17), ("2022-11-25", 4, 16), 
 							("2022-11-25", 1, 2), ("2022-11-25", 10, 4), ("2022-11-20", 16, 11);
                             
+
+-- Adaugat dupa primirea cerintelor, pentru indeplinirea cerintei numarul 7
+-- Se putea adauga in shipment, dar estimam ca facem improvement la shipment prin rezolvarea unui algoritm de path computing NP 
+-- si livram cat mai optim cu un singur shipment
+ALTER TABLE `cars`.`order_` 
+	ADD COLUMN `delivery_location` VARCHAR(256) NULL AFTER `price`;
+
+                            
 -- 1
 DELIMITER //
 CREATE PROCEDURE getAllProducts()
 BEGIN
 	SELECT * FROM `cars`.`model`; 
+END//
+
+-- 2
+DELIMITER //
+CREATE PROCEDURE countOrdersPerShipment()
+BEGIN
+	SELECT shipment_id AS shipment, count(*) AS number_of_orders
+	FROM order_ 
+	GROUP BY shipment_id;
 END//
 
 -- 3
@@ -157,9 +174,21 @@ BEGIN
 				GROUP BY s.id) = 1;
 END//
 
+-- 4
+DELIMITER //
+CREATE PROCEDURE insertProduct(
+    IN `name` varchar(256),
+	IN `model_id` int
+)
+BEGIN
+	INSERT INTO car (`name`, `model_id`) VALUES (`name`, `model_id`);
+END//
+
 -- 5: name sensitive
 DELIMITER //
-CREATE PROCEDURE getShipmentsThatHaveNameLike(IN name_like VARCHAR(256))
+CREATE PROCEDURE getShipmentsThatHaveNameLike(
+	IN name_like VARCHAR(256)
+)
 BEGIN
 	SELECT * 
 		FROM cars.car c JOIN cars.model m
@@ -167,7 +196,16 @@ BEGIN
         WHERE c.name LIKE name_like;
 END//
 
--- Vlad
+-- 6
+DELIMITER //
+CREATE PROCEDURE findTodaySchedules()
+BEGIN
+	SELECT id AS schedule_id
+		FROM service_schedule 
+		WHERE schedule_date >= curdate();
+END//
+
+-- tentativa
 /*DELIMITER //
 CREATE PROCEDURE CountOrdersPerShipment(OUT shipment_ids INT, OUT count_results INT)
 BEGIN
@@ -177,29 +215,80 @@ BEGIN
 END//
 */
 
+-- 7
+/* insert into the DB a user that orders a NEW product, and want to ship it to the 'Pe deal', 
+and to schedule himself for a visit/makeup/repair shop, on 30.02.2023. */
 DELIMITER //
-CREATE PROCEDURE CountOrdersPerShipment()
+CREATE PROCEDURE placeNewOrder(
+	IN client_cnp CHAR(13), 
+    IN car_id INT, 
+	IN deliver_location VARCHAR(256), 
+    IN scheduled_date TIMESTAMP, 
+	IN negotiated_price INT) -- trebuie stabilit si un pret special cu cumparatorul
 BEGIN
-	SELECT shipment_id AS shipment, COUNT(*) AS number_of_orders
-	FROM order_ 
-	GROUP BY shipment_id;
+	set @user_id = -1;
+    -- nu ar trebui sa ne facem griji, deoarece cnp-ul este unic, 
+    -- iar daca nu se va gasi o valoare se va pastra cea default, respectiv -1
+    SELECT id INTO @user_id 
+		FROM `cars`.`client`
+        WHERE cnp = client_cnp;
+	
+    IF (@user_id > 0) THEN
+		IF (SELECT count(*) FROM `cars`.`car` WHERE id = car_id) = 1 THEN
+			START TRANSACTION;
+                SELECT date_add(max(scheduled_date), INTERVAL 1 DAY) INTO @shipment_date 
+					FROM `cars`.`shipment`;
+				
+				-- Daca comanzi asa, primesti livrare premium ziua urmatoare
+				INSERT INTO `cars`.`shipment` (`scheduled_date`, `delivery_company_code`) 
+					VALUES (@shipment_date, "PREMI");
+                        
+				SELECT max(id) INTO @created_shipment_id 
+					FROM `cars`.`shipment`;
+                                    
+				INSERT INTO `cars`.`order_` (`shipment_id`, `client_id`, `delivery_location`, `price`)
+					VALUES (@created_shipment_id, @user_id, deliver_location, negotiated_price);
+                              
+				SELECT max(id) INTO @created_order_id 
+					FROM `cars`.`order_`;
+                                    
+				INSERT INTO `cars`.`order_details` (`order_id`, `car_id`) 
+					VALUES (@created_order_id, car_id);
+                                    
+				INSERT INTO `cars`.`service_schedule` (`schedule_date`, `car_id`, `client_id`)
+					VALUES (scheduled_date, car_id, @user_id);
+                                          
+				SELECT max(id) INTO @created_service_schedule_id FROM `cars`.`service_schedule`;
+			COMMIT;
+			-- Asta e doar pentru vizualizarea rezultatului final
+            SELECT c.first_name as 'first name', c.last_name as 'last name', c.email as 'email', c.phone_number as 'phone', car.name as 'car name',
+					o.id as 'order id', ship.id as 'shipment id aka awb', ship.scheduled_date as 'estimated delivery date',
+                    o.delivery_location as 'delivery location', serv_s.schedule_date as 'service scheduled date'
+				FROM `cars`.`client` c JOIN `cars`.`service_schedule` serv_s JOIN `cars`.`car` car
+					JOIN `cars`.`model` m JOIN `cars`.`order_` o JOIN `cars`.`shipment` ship
+                ON c.id = @user_id AND car.id = car_id AND o.id = @created_order_id AND ship.id = @created_shipment_id
+					AND serv_s.id = @created_service_schedule_id
+                    AND m.id = car.model_id;
+        ELSE
+			-- Handling la faptul ca masina nu exista
+			SELECT "Id-ul masinii nu identifica o masina din lista celor existente." AS 'exception';
+        END IF;
+    ELSE
+		-- Handling la faptul ca CNP-ul este gresit
+		SELECT "CNP-ul dat nu identifica niciun client actual!" AS 'exception';
+	END IF;
 END//
 
-DELIMITER //
-CREATE PROCEDURE InsertProduct(
-    IN `name` varchar(256),
-	IN `model_id` int
-)
-BEGIN
-	INSERT INTO car (`name`, `model_id`)
-    VALUES (`name`, `model_id`);
-END//
+/*
+-- CNP inexistent => eroarea de la CNP
+call placeNewOrder('877587945400a', 1, 'Pe deal', '2022-11-20 00:00:00', 200000);
 
-DELIMITER //
-CREATE PROCEDURE FindTodaySchedules(
-)
-BEGIN
-	SELECT id AS schedule_id
-	FROM service_schedule 
-	WHERE schedule_date >= curdate();
-END//
+-- CNP inexistent si car_id inexistent => eroarea de la CNP
+call placeNewOrder('877587945400a', 43289472, 'Pe deal', '2022-11-20 00:00:00', 200000);
+
+-- car_id inexistent => eroarea de la masina inexistenta
+call placeNewOrder('8775879454007', 43289472, 'Pe deal', '2022-11-20 00:00:00', 200000);
+
+-- CNP bun si car_id bun => insert cu succes!
+call placeNewOrder('8775879454007', 1, 'Pe deal', '2022-11-20 00:00:00', 200000);
+*/
